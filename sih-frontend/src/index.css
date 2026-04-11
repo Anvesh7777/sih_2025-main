@@ -1,0 +1,10 @@
+@import "tailwindcss";
+
+body {
+    margin: 0;
+    background-color: #020617;
+    /* Darkest Navy */
+    font-family: 'Inter', sans-serif;
+    color: #f8fafc;
+}
+
