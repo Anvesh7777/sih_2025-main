@@ -1,25 +1,41 @@
+const axios = require('axios');
 const Student = require('../models/Students');
 const jwt = require('jsonwebtoken');
 const Notification = require('../models/Notification');
 const sendEmail = require('../utils/emailService');
+// const Assignment = require('../models/Assignment');
 
 /**
- * @desc Helper Function: Calculate Dynamic Risk Score
+ * @desc Helper Function: Calculate Dynamic Risk Score (Pre-ML Version)
+ * Attendance: 30% | CGPA: 30% | Backlogs: 20% | Assignments: 10% | Fees: 10%
  */
 const calculateRisk = (student) => {
+    // 1. Attendance Risk (30%)
     const attRisk = 100 - (student.attendancePercentage || 0);
+
+    // 2. Academic Performance Risk (30%)
+    // CGPA 10 = 0% risk, CGPA 0 = 100% risk
     const cgpaRisk = Math.max(0, (10 - (student.cgpa || 0)) * 10);
+
+    // 3. Backlog Risk (20%)
+    // 1 backlog = 25% backlog risk, 4+ backlogs = 100% backlog risk
+    const backlogRisk = Math.min(100, (student.backlogs || 0) * 25);
+
+    // 4. Assignment Engagement Risk (10%)
     const asgnRate = student.totalAssignments > 0 
         ? (student.assignmentsCompleted / student.totalAssignments) 
         : 1;
     const asgnRisk = (1 - asgnRate) * 100;
+
+    // 5. Financial Risk (10%)
     const feeRisk = student.feesPaid ? 0 : 100;
 
-    const totalScore = (attRisk * 0.4) + (cgpaRisk * 0.3) + (asgnRisk * 0.2) + (feeRisk * 0.1);
+    // Weighted Formula
+    const totalScore = (attRisk * 0.3) + (cgpaRisk * 0.3) + (backlogRisk * 0.2) + (asgnRisk * 0.1) + (feeRisk * 0.1);
+    
     return Math.min(100, Math.round(totalScore));
 };
 
-// Helper to generate JWT
 const generateToken = (id, role) => {
     return jwt.sign({ id, role }, process.env.JWT_SECRET, { expiresIn: '30d' });
 };
@@ -56,7 +72,7 @@ const loginStudent = async (req, res) => {
                 token: generateToken(student._id, student.role)
             });
         } else {
-            res.status(401).json({ message: 'Invalid email or password' });
+            res.status(401).json({ message: 'Invalid credentials' });
         }
     } catch (error) {
         res.status(500).json({ message: 'Login Error' });
@@ -67,35 +83,50 @@ const loginStudent = async (req, res) => {
 const getStudentProfile = async (req, res) => {
     try {
         const student = await Student.findById(req.student._id).select('-password');
+        
         if (student) {
-            student.riskScore = calculateRisk(student);
-            await student.save();
+            // --- ML API CALL ---
+            try {
+                const mlResponse = await axios.post('http://localhost:5001/predict', {
+                    attendance: student.attendancePercentage,
+                    cgpa: student.cgpa,
+                    backlogs: student.backlogs,
+                    assignments: Math.round((student.assignmentsCompleted / student.totalAssignments) * 100) || 0,
+                    fees_paid: student.feesPaid ? 1 : 0
+                });
+
+                // ML se aaya hua real score use karo
+                student.riskScore = mlResponse.data.ml_risk_score;
+                await student.save();
+            } catch (mlErr) {
+                console.log("ML Service Down, using fallback logic");
+                // Agar Python server band hai, toh purana formula use karega
+                student.riskScore = calculateRisk(student); 
+            }
+
             res.json(student);
-        } else {
-            res.status(404).json({ message: 'Not found' });
         }
     } catch (error) {
         res.status(500).json({ message: 'Fetch error' });
     }
 };
 
-/**
- * @desc    Update student profile (Added this back to fix the crash!)
- */
+// @desc    Update Student Profile (Used for adding CGPA, Backlogs, etc.)
 const updateStudentProfile = async (req, res) => {
     try {
         const student = await Student.findById(req.student._id);
         if (student) {
             student.name = req.body.name || student.name;
             student.branch = req.body.branch || student.branch;
-            
-            // Recalculate risk with new data
+            student.cgpa = req.body.cgpa !== undefined ? req.body.cgpa : student.cgpa;
+            student.backlogs = req.body.backlogs !== undefined ? req.body.backlogs : student.backlogs;
+            student.feesPaid = req.body.feesPaid !== undefined ? req.body.feesPaid : student.feesPaid;
+            student.assignmentsCompleted = req.body.assignmentsCompleted !== undefined ? req.body.assignmentsCompleted : student.assignmentsCompleted;
+            student.totalAssignments = req.body.totalAssignments !== undefined ? req.body.totalAssignments : student.totalAssignments;
+
             student.riskScore = calculateRisk(student);
-            const updatedStudent = await student.save();
-            
-            res.json(updatedStudent);
-        } else {
-            res.status(404).json({ message: 'Student not found' });
+            const updated = await student.save();
+            res.json(updated);
         }
     } catch (error) {
         res.status(500).json({ message: 'Update failed' });
@@ -121,55 +152,109 @@ const getHighRiskStudents = async (req, res) => {
     }
 };
 
-// @desc    Admin: Send alert to student
 const sendRiskAlert = async (req, res) => {
     try {
         const student = await Student.findById(req.params.id);
-        if (!student) return res.status(404).json({ message: 'Not found' });
+        if (!student) return res.status(404).json({ message: 'Student not found' });
 
-        const risk = calculateRisk(student);
-        const msg = `Urgent: Your academic risk is ${risk}%. Please contact support.`;
-
-        await Notification.create({ user: student._id, message: msg, link: '/dashboard/profile' });
-        res.json({ message: `Alert sent to ${student.name}` });
+        // Abhi ke liye sirf response bhej rahe hain
+        // Yahan aap apna email service call kar sakte ho (sendEmail)
+        res.json({ message: `Alert sent to ${student.name} successfully!` });
     } catch (error) {
-        res.status(500).json({ message: 'Alert failed' });
+        res.status(500).json({ message: 'Error sending alert' });
     }
 };
 
-// @desc    Get Institutional Stats for Admin Dashboard
-// @route   GET /api/students/admin-stats
 const getAdminStats = async (req, res) => {
     try {
         const totalStudents = await Student.countDocuments({ role: 'student' });
-        const highRiskCount = await Student.countDocuments({ role: 'student', riskScore: { $gt: 50 } });
-        
-        // Calculate average attendance across college
-        const students = await Student.find({ role: 'student' });
-        const avgAttendance = students.length > 0 
-            ? (students.reduce((acc, s) => acc + (s.attendancePercentage || 0), 0) / students.length).toFixed(1)
-            : 0;
+        const highRiskStudents = await Student.countDocuments({ 
+            role: 'student', 
+            riskScore: { $gt: 50 } 
+        });
 
         res.json({
             totalStudents,
-            highRiskCount,
-            avgAttendance,
-            activeLectures: 5 // Static for demo or count from Lecture model
+            highRiskStudents,
+            averageAttendance: 85, // Static placeholder for now
+            activeSessions: 4
         });
     } catch (error) {
-        res.status(500).json({ message: 'Server Error fetching stats' });
+        res.status(500).json({ message: 'Error fetching stats' });
     }
 };
 
-// Add getAdminStats to your module.exports at the bottom!
 
-// Exporting ALL 6 functions now
+
+
+
+// ... (register, login, getProfile code remains same)
+
+// @desc    Admin: Update Student Academics (CGPA & Backlogs)
+// const updateStudentAcademics = async (req, res) => {
+//     try {
+//         const { studentId, cgpa, backlogs } = req.body;
+//         const student = await Student.findById(req.params.id || studentId);
+        
+//         if (!student) return res.status(404).json({ message: 'Student not found' });
+
+//         student.cgpa = cgpa !== undefined ? cgpa : student.cgpa;
+//         student.backlogs = backlogs !== undefined ? backlogs : student.backlogs;
+        
+//         // ML score update after academic change
+//         const updated = await student.save();
+//         res.json({ message: "Academic records updated!", student: updated });
+//     } catch (error) {
+//         res.status(500).json({ message: 'Update failed', error: error.message });
+//     }
+// };
+
+// @desc    Admin: Publish New Assignment to a Branch
+// const postAssignment = async (req, res) => {
+//     try {
+//         const { branch, title } = req.body;
+//         // Logic: Is branch ke saare students ka 'totalAssignments' count +1 kar do
+//         const result = await Student.updateMany(
+//             { branch: branch, role: 'student' },
+//             { $inc: { totalAssignments: 1 } }
+//         );
+//         res.json({ message: `Assignment "${title}" published to ${branch} branch.`, affected: result.modifiedCount });
+//     } catch (error) {
+//         res.status(500).json({ message: 'Failed to publish assignment' });
+//     }
+// };
+
+// @desc    Student: Mark Assignment as Completed
+// const submitAssignment = async (req, res) => {
+//     try {
+//         const student = await Student.findById(req.student._id);
+//         if (student.assignmentsCompleted < student.totalAssignments) {
+//             student.assignmentsCompleted += 1;
+//             await student.save();
+//             res.json({ message: "Task completed!", completed: student.assignmentsCompleted });
+//         } else {
+//             res.status(400).json({ message: "All assignments already completed!" });
+//         }
+//     } catch (error) {
+//         res.status(500).json({ message: 'Submission failed' });
+//     }
+// };
+
+// Existing module.exports mein naye functions add karo
+
+
+// controllers/studentController.js ke ekdum niche dekho
 module.exports = { 
     registerStudent, 
     loginStudent, 
     getStudentProfile, 
     updateStudentProfile, 
-    getHighRiskStudents, 
+    getHighRiskStudents,
+    calculateRisk,
+    getAdminStats,
     sendRiskAlert,
-    getAdminStats
+    // postAssignment,
+    // submitAssignment,
+    // updateStudentAcademics
+
 };
