@@ -27,3 +27,9 @@ Thumbs.db
 # Logs
 logs
 *.log
+
+
+node_modules/
+__pycache__/
+*.pkl
+.env
